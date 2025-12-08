@@ -10,4 +10,5 @@ Stereo RAW Microphone
 Low Pass Filter Disable
 
 **{ * } Credit :**
+
 Node Stereo By : [Skenzo](https://github.com/outpunching)
