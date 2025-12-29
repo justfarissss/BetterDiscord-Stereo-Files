@@ -47,12 +47,13 @@ if (isLogDirAvailable) {
 }
 
 const defaultAudioSubsystem = process.platform === 'win32' ? 'experimental' : 'standard';
-const useLegacyAudioDevice = appSettings ? appSettings.getSync('useLegacyAudioDevice') : false;
-const audioSubsystemSelected = appSettings
+const audioSubsystem = appSettings
   ? appSettings.getSync('audioSubsystem', defaultAudioSubsystem)
   : defaultAudioSubsystem;
-const audioSubsystem = useLegacyAudioDevice || audioSubsystemSelected;
+const offloadAdmControls = appSettings ? appSettings.getSync('offloadAdmControls', false) : false;
 const debugLogging = appSettings ? appSettings.getSync('debugLogging', true) : true;
+const asyncVideoInputDeviceInit = appSettings ? appSettings.getSync('asyncVideoInputDeviceInit', false) : false;
+const asyncClipsSourceDeinit = appSettings ? appSettings.getSync('asyncClipsSourceDeinit', false) : false;
 
 function versionGreaterThanOrEqual(v1, v2) {
   const v1parts = v1.split('.').map(Number);
@@ -77,7 +78,7 @@ function parseArguments(args) {
     'use-fake-video-capture': 'Use fake video capture device.',
     'use-file-for-fake-video-capture': 'Use local file for fake video capture.',
     'use-fake-audio-capture': 'Use fake audio capture device.',
-    'use-file-for-fake-audio-capture': 'Use local file for fake audio capture.',
+    'use-files-for-fake-audio-capture': 'Use local files for fake audio capture.',
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -113,8 +114,8 @@ function parseArguments(args) {
       case '--use-fake-audio-capture':
         parsed['use-fake-audio-capture'] = true;
         break;
-      case '--use-file-for-fake-audio-capture':
-        parsed['use-file-for-fake-audio-capture'] = getValue();
+      case '--use-files-for-fake-audio-capture':
+        parsed['use-files-for-fake-audio-capture'] = getValue();
         break;
     }
   }
@@ -127,7 +128,7 @@ const logLevel = argv['log-level'] === -1 ? (debugLogging ? 2 : -1) : argv['log-
 const useFakeVideoCapture = argv['use-fake-video-capture'];
 const useFileForFakeVideoCapture = argv['use-file-for-fake-video-capture'];
 const useFakeAudioCapture = argv['use-fake-audio-capture'];
-const useFileForFakeAudioCapture = argv['use-file-for-fake-audio-capture'];
+const useFilesForFakeAudioCapture = argv['use-files-for-fake-audio-capture'];
 
 features.declareSupported('voice_panning');
 features.declareSupported('voice_multiple_connections');
@@ -139,7 +140,7 @@ features.declareSupported('set_video_device_by_id');
 features.declareSupported('loopback');
 features.declareSupported('experiment_config');
 features.declareSupported('remote_locus_network_control');
-features.declareSupported('connection_replay');
+//features.declareSupported('connection_replay');
 features.declareSupported('simulcast');
 features.declareSupported('simulcast_bugfix');
 features.declareSupported('direct_video');
@@ -152,6 +153,12 @@ features.declareSupported('bandwidth_estimation_experiments');
 features.declareSupported('mls_pairwise_fingerprints');
 features.declareSupported('soundshare');
 features.declareSupported('screen_soundshare');
+features.declareSupported('offload_adm_controls');
+features.declareSupported('audio_codec_red');
+features.declareSupported('sidechain_compression');
+features.declareSupported('async_video_input_device_init');
+features.declareSupported('async_clips_source_deinit');
+features.declareSupported('port_aware_latency_testing');
 
 if (process.platform === 'darwin') {
   features.declareSupported('screen_capture_kit');
@@ -163,8 +170,30 @@ if (process.platform === 'darwin') {
 if (process.platform === 'linux') {
   // from WebRTC DesktopCapturer::IsRunningUnderWayland()
   const sessionType = process.env.XDG_SESSION_TYPE;
-  if (sessionType?.startsWith('wayland') && process.env.WAYLAND_DISPLAY != null) {
+  const isUnderWayland = sessionType?.startsWith('wayland') && process.env.WAYLAND_DISPLAY != null;
+
+  const currentDesktop = process.env.XDG_CURRENT_DESKTOP;
+  // we only want to enable the gamescope capturer if we're running in a non-nested gamescope session
+  const isUnderGamescope =
+    !isUnderWayland && currentDesktop?.includes('gamescope') && process.env.GAMESCOPE_WAYLAND_DISPLAY != null;
+  const isVaapiEnabled = VoiceEngine.isVaapiEnabled();
+
+  if (isUnderWayland) {
     features.declareSupported('native_screenshare_picker');
+  }
+  if (isVaapiEnabled) {
+    features.declareSupported('vaapi');
+  }
+  if (isUnderGamescope && isVaapiEnabled) {
+    // ensure we have access to the pipewire socket
+    const runtimeDir = process.env.PIPEWIRE_RUNTIME_DIR || process.env.XDG_RUNTIME_DIR || process.env.USERPROFILE;
+    if (runtimeDir) {
+      const socketName = runtimeDir + '/' + (process.env.PIPEWIRE_REMOTE || 'pipewire-0');
+      const sstat = fs.statSync(socketName, {throwIfNoEntry: false});
+      if (sstat && sstat.isSocket()) {
+        features.declareSupported('gamescope_capture');
+      }
+    }
   }
 }
 
@@ -193,10 +222,7 @@ if (process.platform === 'win32') {
   features.declareSupported('voice_experimental_subsystem');
   features.declareSupported('voice_automatic_subsystem');
   features.declareSupported('voice_subsystem_deferred_switch');
-  // NOTE(jvass): currently there's no experimental encoders! Add this back if you
-  // add one and want to re-enable the UI for them.
-  // features.declareSupported('experimental_encoders');
-  features.declareSupported('capture_timeout_experiments');
+  features.declareSupported('voice_bypass_system_audio_input_processing');
   features.declareSupported('clips');
 }
 
@@ -250,6 +276,8 @@ function bindConnectionInstance(instance) {
 
     setOnVideoCallback: (callback) => instance.setOnVideoCallback(callback),
     setOnFirstFrameCallback: (callback) => instance.setOnFirstFrameCallback(callback),
+    setOnFirstFrameDeliveredStatsCallback: (callback) => instance.setOnFirstFrameDeliveredStatsCallback(callback),
+    setOnFirstFrameEncryptedStatsCallback: (callback) => instance.setOnFirstFrameEncryptedStatsCallback(callback),
     setVideoBroadcast: (broadcasting) => instance.setVideoBroadcast(broadcasting),
     setDesktopSource: (id, videoHook, type) => instance.setDesktopSource(id, videoHook, type),
     setDesktopSourceWithOptions: (options) => instance.setDesktopSourceWithOptions(options),
@@ -261,7 +289,7 @@ function bindConnectionInstance(instance) {
     setOnSoundshare: (callback) => instance.setOnSoundshare(callback),
     setOnSoundshareEnded: (callback) => instance.setOnSoundshareEnded(callback),
     setOnSoundshareFailed: (callback) => instance.setOnSoundshareFailed(callback),
-    setPTTActive: (active, priority) => instance.setPTTActive(active, priority),
+    setPTTActive: (active, priority, muteOverride) => instance.setPTTActive(active, priority, muteOverride),
     getStats: (callback) => instance.getStats(callback),
     getFilteredStats: (filter, callback) => instance.getFilteredStats(filter, callback),
     startReplay: () => instance.startReplay(),
@@ -308,7 +336,6 @@ const setAudioSubsystemInternal = function (subsystem, forceRestart) {
   }
 
   appSettings.set('audioSubsystem', subsystem);
-  appSettings.set('useLegacyAudioDevice', false);
 
   if (isElectronRenderer) {
     if (forceRestart) {
@@ -330,6 +357,18 @@ VoiceEngine.setAudioSubsystem = function (subsystem) {
 
 VoiceEngine.queueAudioSubsystem = function (subsystem) {
   setAudioSubsystemInternal(subsystem, false);
+};
+
+VoiceEngine.setOffloadAdmControls = function (doOffload) {
+  appSettings.set('offloadAdmControls', doOffload);
+};
+
+VoiceEngine.setAsyncVideoInputDeviceInitSetting = function (enable) {
+  appSettings.set('asyncVideoInputDeviceInit', enable);
+};
+
+VoiceEngine.setAsyncClipsSourceDeinitSetting = function (enable) {
+  appSettings.set('asyncClipsSourceDeinit', enable);
 };
 
 VoiceEngine.setDebugLogging = function (enable) {
@@ -533,7 +572,10 @@ VoiceEngine.initialize({
   useFakeVideoCapture,
   useFileForFakeVideoCapture,
   useFakeAudioCapture,
-  useFileForFakeAudioCapture,
+  useFilesForFakeAudioCapture,
+  offloadAdmControls,
+  asyncVideoInputDeviceInit,
+  asyncClipsSourceDeinit,
 });
 
 module.exports = VoiceEngine;
